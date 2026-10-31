@@ -45,6 +45,19 @@ Your mic can pick up sound from your speakers, so while any of these play, the m
 
 Settings are saved in `localStorage`.
 
+## While you play
+
+The control strip at the top right of the game has:
+- **⏮ Rewind** (← or R): goes back to the start of the current line, with a short run-up. Its walls go back up. If you haven't cleared a note of that line yet, it goes back one more line. Lines are the lyric lines, or groups of 8 notes when there are no lyrics. A note you missed or bounced off before rewinding doesn't count as "first try" when you sing it again.
+- **− / +** (− and + keys, or [ and ]): slower or faster, in 10% steps from 50% to 150% of the tempo you picked. The walls stay where they are and the ball moves more slowly or quickly. This works during the countdown and the demo too. Play again keeps the speed; starting from the menu resets it to 100%.
+
+## After the song
+
+The results screen shows the usual totals, plus how sharp or flat you sang on average (**lean**). Below that:
+- **What to work on**: habits spotted in your singing, such as going flat on the high notes, overshooting upward jumps, or long notes sagging as you hold them. It also names the line that gave you the most trouble. Only the parts of each note sung within a semitone of the target count toward these, so a wrong note doesn't look like a tuning habit.
+- **Note by note**: one card per line, with a trace of your pitch drawn over the target notes and a chip for each note. Each chip shows the syllable, the note, and how sharp (+) or flat (−) you were, colored green (within 15¢), light green (within 35¢), yellow (cleared) or red (missed). ↻ shows retries. If you bounced off a wall, only the last try is shown.
+- **Practise ▸** on any line loops just that line. It starts at 80% speed (or slower, if you sang the song slower). A clean pass, with every note first try, speeds it up 10%. Two missed passes in a row slow it down 10%. A clean pass at full speed masters the line. Press **Done practising** at any time to go back to the song's results.
+
 ## How pitch detection works
 
 1. **Detect** (`js/audio.js`): each frame, YIN estimates the pitch from the latest ~43 ms of audio and reports its *CMND*, a 0–1 score of how aperiodic the sound is (≈ 1 / (1 + signal-to-noise ratio)). It doesn't make any keep-or-discard decisions.
@@ -64,5 +77,6 @@ Settings are saved in `localStorage`.
 - `js/audio.js`: microphone capture, YIN pitch detection, guide tones
 - `js/pitchtrack.js`: silence and confidence decisions plus the One-Euro filter (turns raw estimates into a steady pitch track)
 - `js/debug.js`: the pitch-detection debug overlay
+- `js/review.js`: the results review: tips about sharp/flat habits, per-line pitch traces and note chips
 - `js/music.js`: note maths, scales, songs, sequence generation
 - `server.js`: a tiny zero-dependency static server

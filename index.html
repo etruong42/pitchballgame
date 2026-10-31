@@ -19,7 +19,14 @@
       <div class="hud-box"><span class="hud-label">Streak</span><span id="hudStreak">0</span></div>
       <div class="hud-box wide"><span class="hud-label">Target</span><span id="hudTarget">—</span></div>
       <div class="hud-box wide"><span class="hud-label">You</span><span id="hudSung">—</span></div>
+      <div id="hudPractice" class="hud-box wide" hidden><span class="hud-label">Practising</span><span id="hudPracticeInfo"></span></div>
       <div class="hud-spacer"></div>
+      <div class="hud-ctrl" role="group" aria-label="Playback">
+        <button id="btnRewind" class="ghost icon" title="Back to the start of the line (← or R)" aria-label="Rewind to the start of the line">⏮</button>
+        <button id="btnSlower" class="ghost icon" title="Slower (−)" aria-label="Slower">−</button>
+        <span id="hudTempo" class="hud-tempo" aria-live="polite">100%</span>
+        <button id="btnFaster" class="ghost icon" title="Faster (+)" aria-label="Faster">+</button>
+      </div>
       <button id="btnSkipPreview" class="ghost" hidden title="Skip (Space)">Skip scale ▸</button>
       <button id="btnPause" class="ghost" title="Pause (Esc)">Pause</button>
       <button id="btnQuit" class="ghost">Quit</button>
@@ -237,17 +244,26 @@
   </div>
 
   <div id="results" class="overlay" hidden>
-    <div class="panel small-panel">
+    <div class="panel results-panel">
       <h2 id="resTitle">Nice singing!</h2>
+      <p id="resSub" class="res-sub" hidden></p>
       <div id="resStars" class="stars"></div>
       <dl class="stats">
         <div><dt id="resScoreLabel">Holes cleared</dt><dd id="resScore"></dd></div>
         <div id="resBouncesRow"><dt>Bounces</dt><dd id="resBounces"></dd></div>
         <div><dt>Best streak</dt><dd id="resStreak"></dd></div>
         <div><dt>Average pitch error</dt><dd id="resCents"></dd></div>
+        <div><dt>Sharp or flat lean</dt><dd id="resLean"></dd></div>
+        <div id="resRewindsRow"><dt>Rewinds</dt><dd id="resRewinds"></dd></div>
+        <div id="resTempoRow"><dt>Speed</dt><dd id="resTempo"></dd></div>
       </dl>
-      <button id="btnAgain" class="primary">Play again</button>
-      <button id="btnSettings" class="ghost">Change settings</button>
+      <div class="res-actions">
+        <button id="btnAgain" class="primary">Play again</button>
+        <button id="btnBackFull" class="ghost" hidden>Back to song results</button>
+        <button id="btnFullSong" class="ghost" hidden>Play the whole song</button>
+        <button id="btnSettings" class="ghost">Change settings</button>
+      </div>
+      <div id="resReview"></div>
     </div>
   </div>
 

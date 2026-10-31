@@ -6,6 +6,7 @@ import {
   NOTE_NAMES, SCALES, SONGS, SONG_MODES, buildSequence, midiToName, previewScaleNotes,
   parseSongText, setCustomSong, isCustomSongKey, parseLyrics,
 } from './music.js';
+import { renderReview, drawTraces, overallLean, fmtCents, NEAR_CENTS } from './review.js';
 
 // ---------------------------------------------------------------------------
 // World constants
@@ -20,6 +21,10 @@ const MIN_GAP = 1.2;     // minimum free space between consecutive walls
 const MIN_NOTE_S = 0.18; // notes with walls shorter than this (in seconds) are stretched to it
 const LATENCY_S = 0.3;   // seconds of slack for pitch-detection + ball movement lag
 const BOUNCE_ACCEL = 1.5; // after a bounce, the ball regains forward speed at this many × speed per second
+const TEMPO_MIN = 0.5, TEMPO_MAX = 1.5, TEMPO_STEP = 0.1; // live speed control, as a multiple of the set tempo
+const PRACTICE_TEMPO = 0.8; // line practice starts this much slower and speeds up after clean passes
+const PHRASE_CHUNK = 8;  // without lyrics, lines are this many notes
+const REWIND_RUNUP = 2.5; // beats of run-up before the line the ball rewinds to
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -73,6 +78,8 @@ const ui = {
   preview: $('preview'), holeInfo: $('holeInfo'), bpmInfo: $('bpmInfo'), menuError: $('menuError'),
   btnStart: $('btnStart'), customEditor: $('customEditor'), csName: $('csName'), csRoot: $('csRoot'),
   csMode: $('csMode'), csText: $('csText'), csStatus: $('csStatus'), csDelete: $('csDelete'), csExample: $('csExample'),
+  tempo: $('hudTempo'), btnSlower: $('btnSlower'), btnFaster: $('btnFaster'), btnRewind: $('btnRewind'),
+  btnQuit: $('btnQuit'), practiceBox: $('hudPractice'), practiceInfo: $('hudPracticeInfo'),
   sensRow: $('sensRow'), retriesRow: $('retriesRow'), headphonesRow: $('headphonesRow'), skipPreview: $('btnSkipPreview'),
 };
 
@@ -448,7 +455,7 @@ function buildLevel(seq) {
   const speed = BEAT_LEN * settings.bpm / 60;
   const lag = LATENCY_S * speed; // walls start a touch after the beat so on-time singing lands
   const layout = layoutNotes(seq);
-  const notes = layout.notes.map(n => {
+  const notes = layout.notes.map((n, noteIdx) => {
     const onset = LEAD_BEATS * BEAT_LEN + n.startBeat * BEAT_LEN;
     const span = n.layoutBeats * BEAT_LEN;
     const note = { ...n, onset, end: onset + span };
@@ -456,8 +463,8 @@ function buildLevel(seq) {
       const dStart = onset + lag;
       const depth = Math.max(Math.min(0.5, span * 0.45), Math.min(span * 0.5, span - lag - MIN_GAP));
       note.wall = {
-        i: walls.length, midi: n.midi, holeY: yFor(n.midi), dStart, dEnd: dStart + depth, lyric: n.lyric,
-        state: 'pending', outDist: 0, errSum: 0, samples: 0, toneDone: false, attempts: 0, flash: 0,
+        i: walls.length, noteIdx, midi: n.midi, holeY: yFor(n.midi), dStart, dEnd: dStart + depth, dNoteEnd: dStart + span, lyric: n.lyric,
+        state: 'pending', toneDone: false, flash: 0, prior: 0, ...freshAttempt(),
       };
       walls.push(note.wall);
     }
@@ -549,8 +556,45 @@ function buildLevel(seq) {
     n.syl = syllables.length;
     syllables.push(n.lyric);
   }
-  level = { walls, notes, syllables, minMidi, maxMidi, holeR, groundGap, wallH, endD, noteLabels, yFor };
+  level = { walls, notes, syllables, phrases: makePhrases(walls), minMidi, maxMidi, holeR, groundGap, wallH, endD, noteLabels, yFor };
   lyricCache = '';
+}
+
+// Per-attempt measurements on a wall, cleared when the ball bounces off it.
+// Sums are weighted by distance; samples is the distance sung inside the wall.
+// errSum: |error| in cents; signedSum: signed error; nearSum/nearN: signed
+// error where within NEAR_CENTS (intonation, not wrong notes);
+// trace: the sung pitch on the way to and through the wall.
+function freshAttempt() {
+  return { outDist: 0, errSum: 0, signedSum: 0, samples: 0, nearSum: 0, nearN: 0, trace: [], attempts: 0 };
+}
+
+// Lines to review, rewind to and practise: the lyric lines, or chunks of
+// notes when there are no lyrics. noteStart/noteEnd index the sequence.
+function makePhrases(walls) {
+  const phrases = [];
+  const lyricLines = walls.every(w => w.lyric);
+  walls.forEach((w, k) => {
+    const key = lyricLines ? w.lyric.line : Math.floor(k / PHRASE_CHUNK);
+    const last = phrases[phrases.length - 1];
+    if (last && last.key === key) last.last = k;
+    else phrases.push({ key, first: k, last: k });
+  });
+  // A short leftover chunk joins the line before it.
+  const tail = phrases[phrases.length - 1];
+  if (!lyricLines && phrases.length > 1 && tail.last - tail.first + 1 < PHRASE_CHUNK / 2) {
+    phrases.pop();
+    phrases[phrases.length - 1].last = tail.last;
+  }
+  for (const ph of phrases) {
+    const ws = walls.slice(ph.first, ph.last + 1);
+    ph.noteStart = ws[0].noteIdx;
+    ph.noteEnd = ws[ws.length - 1].noteIdx + 1;
+    ph.text = lyricLines
+      ? ws.filter(w => !w.lyric.cont).map(w => w.lyric.text + (w.lyric.wordEnd ? ' ' : '')).join('').trim()
+      : ws.map(w => midiToName(w.midi)).join(' ');
+  }
+  return phrases;
 }
 
 // Beat positions for a sequence at the current tempo. Notes with walls that
@@ -726,9 +770,17 @@ const debugOverlay = new PitchDebugOverlay(ui.debug, tracker.p);
 const game = {
   state: 'menu', // menu | countdown | playing | paused | results
   d: 0, speed: 8, countdown: 0, nextWall: 0,
-  score: 0, firstTry: 0, bounces: 0, vel: 0, freeY: BALL_R, streak: 0, bestStreak: 0, centsSum: 0, centsN: 0,
+  score: 0, firstTry: 0, bounces: 0, vel: 0, freeY: BALL_R, streak: 0, bestStreak: 0,
   sungMidi: null, heardMidi: null, foldShift: null, time: 0, shake: 0,
+  tempo: 1, tempoMin: 1, tempoMax: 1, rewinds: 0,
 };
+
+// Line practice: when set, the game plays only sequence[noteStart, noteEnd)
+// and loops it, speeding up after clean passes.
+let practice = null; // { phrase, noteStart, noteEnd, text, pass, misses }
+let lastFull = null; // review of the last full run, to come back to after practising
+
+const baseSpeed = () => BEAT_LEN * settings.bpm / 60;
 
 function currentTargetWall() {
   if (!level) return null;
@@ -768,7 +820,7 @@ function regenerate() {
   refreshMenuLabels();
 }
 
-async function startGame(sameSequence = false) {
+async function startGame(sameSequence = false, opts = {}) {
   ui.menuError.hidden = true;
   audio.ensureContext();
   if (settings.input === 'mic') {
@@ -787,29 +839,39 @@ async function startGame(sameSequence = false) {
   }
 
   if (!sameSequence) sequence = buildSequence(settings);
-  buildLevel(sequence);
+  practice = opts.practice || null;
+  setupRun(opts.tempo ?? 1);
+  ui.menu.hidden = true;
+  ui.mouseHint.hidden = settings.input !== 'mouse';
+  ui.tuner.hidden = !settings.showTuner;
+  ui.debug.hidden = !settings.showDebug;
+  debugOverlay.clear();
+  // Optional intros run in order before the countdown (not when practising a line).
+  game.intros = practice ? [] : [settings.previewScale && startPreview, settings.demoTrack && startDemo].filter(Boolean);
+  nextIntro();
+}
+
+// Fresh walls, ball and score for a run of the song (or of the practised line).
+function setupRun(tempo) {
+  buildLevel(practice ? sequence.slice(practice.noteStart, practice.noteEnd) : sequence);
   clearFx();
   resetBall();
   Object.assign(game, {
     state: 'countdown', d: 0, countdown: 3, nextWall: 0,
-    speed: BEAT_LEN * settings.bpm / 60,
-    vel: BEAT_LEN * settings.bpm / 60,
-    score: 0, firstTry: 0, bounces: 0, freeY: BALL_R, streak: 0, bestStreak: 0, centsSum: 0, centsN: 0,
+    score: 0, firstTry: 0, bounces: 0, freeY: BALL_R, streak: 0, bestStreak: 0, rewinds: 0,
     sungMidi: null, heardMidi: null, foldShift: null, shake: 0,
   });
-  ui.menu.hidden = true;
+  setTempo(tempo, false);
+  game.tempoMin = game.tempoMax = game.tempo;
+  game.vel = game.speed;
   ui.results.hidden = true;
   ui.pause.hidden = true;
   ui.hud.hidden = false;
-  ui.mouseHint.hidden = settings.input !== 'mouse';
-  ui.tuner.hidden = !settings.showTuner;
-  ui.debug.hidden = !settings.showDebug;
+  ui.btnQuit.textContent = practice ? 'Done practising' : 'Quit';
+  ui.practiceBox.hidden = !practice;
+  if (practice) ui.practiceInfo.textContent = `Line ${practice.phrase + 1} · pass ${practice.pass}`;
   tracker.reset();
-  debugOverlay.clear();
   snapCamera();
-  // Optional intros run in order before the countdown.
-  game.intros = [settings.previewScale && startPreview, settings.demoTrack && startDemo].filter(Boolean);
-  nextIntro();
 }
 
 function nextIntro() {
@@ -818,14 +880,14 @@ function nextIntro() {
   else startCountdown();
 }
 
-function startCountdown() {
+function startCountdown(secs = 3) {
   game.state = 'countdown';
-  game.countdown = 3;
+  game.countdown = secs;
   tracker.reset();
   ui.skipPreview.hidden = true;
   ui.countdown.className = '';
   ui.countdown.hidden = false;
-  ui.countdown.textContent = '3';
+  ui.countdown.textContent = String(secs);
   if (settings.guideTone) audio.playTone(level.walls[0].midi, 0.6, 0.2, !settings.headphones);
 }
 
@@ -919,7 +981,7 @@ function endPreview() {
 function startDemo() {
   // Sound starts on the beat; the ball moves a little later so it reaches each
   // hole just before its wall, which sits LATENCY_S after the beat.
-  const shift = (LATENCY_S - 0.14) * game.speed;
+  const shift = (LATENCY_S - 0.14) * baseSpeed(); // walls were laid out at the set tempo
   game.state = 'demo';
   game.demo = { notes: level.notes, shift, sound: -1, ball: -1 };
   game.d = 0;
@@ -934,7 +996,7 @@ function startDemo() {
 
 function updateDemo() {
   const dm = game.demo;
-  const secPerBeat = 60 / settings.bpm;
+  const secPerBeat = 60 / (settings.bpm * game.tempo);
   while (dm.sound + 1 < dm.notes.length && game.d >= dm.notes[dm.sound + 1].onset) {
     const n = dm.notes[++dm.sound];
     if (n.rest) continue;
@@ -951,15 +1013,7 @@ function updateDemo() {
 function endDemo() {
   if (game.state !== 'demo') return;
   audio.stopNotes();
-  // Fresh walls and ball for the real round.
-  buildLevel(sequence);
-  clearFx();
-  resetBall();
-  Object.assign(game, {
-    d: 0, nextWall: 0, vel: game.speed, freeY: BALL_R, sungMidi: null, heardMidi: null,
-    score: 0, firstTry: 0, bounces: 0, streak: 0, bestStreak: 0, centsSum: 0, centsN: 0, shake: 0,
-  });
-  snapCamera();
+  setupRun(game.tempo); // fresh walls and ball for the real round
   nextIntro();
 }
 
@@ -970,6 +1024,8 @@ function showMenuError(msg) {
 
 function toMenu() {
   game.state = 'menu';
+  practice = null;
+  lastFull = null;
   ui.hud.hidden = true;
   ui.countdown.hidden = true;
   ui.pause.hidden = true;
@@ -996,18 +1052,201 @@ function setPaused(p) {
 function finishGame() {
   game.state = 'results';
   ui.hud.hidden = true;
-  const total = level.walls.length;
-  const ratio = game.firstTry / total;
+  const review = makeReview();
+  if (practice) { practiceLoop(review); return; }
+  lastFull = review;
+  showResults(review);
+}
+
+// Everything the results screen needs, copied out of the level so it
+// survives the level being rebuilt for practice.
+function makeReview() {
+  const notes = level.walls.map(w => {
+    const attempts = w.attempts + w.prior;
+    const passed = w.state === 'pass';
+    // Drift on long notes: signed error over the second half of the wall minus the first half.
+    let drift = null;
+    if (w.dEnd - w.dStart >= 0.8 * BEAT_LEN) {
+      const mid = (w.dStart + w.dEnd) / 2;
+      const near = w.trace.filter(p => p.m !== null && p.d >= w.dStart && p.d <= w.dEnd && Math.abs(p.m - w.midi) * 100 <= NEAR_CENTS);
+      const a = near.filter(p => p.d < mid), b = near.filter(p => p.d >= mid);
+      if (a.length >= 3 && b.length >= 3) {
+        const avg = ps => ps.reduce((s, p) => s + (p.m - w.midi) * 100, 0) / ps.length;
+        drift = avg(b) - avg(a);
+      }
+    }
+    return {
+      midi: w.midi, passed, attempts, firstTry: passed && attempts === 0,
+      voiced: w.samples > 0,
+      cents: w.samples ? w.errSum / w.samples : 0,
+      signedAll: w.samples ? w.signedSum / w.samples : 0,
+      // Lean only counts when most of the note was sung close to pitch.
+      signed: w.nearN > 0 && w.nearN >= 0.5 * w.samples ? w.nearSum / w.nearN : null,
+      drift,
+      syllable: w.lyric && !w.lyric.cont ? w.lyric.text : '', held: !!(w.lyric && w.lyric.cont),
+      dStart: w.dStart, dEnd: w.dEnd, dNoteEnd: w.dNoteEnd, trace: w.trace.slice(),
+    };
+  });
+  return {
+    notes, phrases: level.phrases.map(p => ({ ...p })),
+    minMidi: level.minMidi, maxMidi: level.maxMidi, tol: (level.holeR - BALL_R) / SEMI, beatLen: BEAT_LEN,
+    firstTry: notes.filter(n => n.firstTry).length, bounces: game.bounces, bestStreak: game.bestStreak,
+    rewinds: game.rewinds, tempoMin: game.tempoMin, tempoMax: game.tempoMax, tempo: game.tempo,
+    practice: practice && { phrase: practice.phrase, noteStart: practice.noteStart, noteEnd: practice.noteEnd, text: practice.text, pass: practice.pass },
+  };
+}
+
+let shownReview = null;
+function showResults(r, { mastered = false } = {}) {
+  shownReview = r;
+  game.state = 'results';
+  ui.hud.hidden = true;
+  ui.countdown.hidden = true;
+  const total = r.notes.length;
+  const ratio = r.firstTry / total;
   const stars = ratio >= 0.9 ? 3 : ratio >= 0.7 ? 2 : ratio >= 0.4 ? 1 : 0;
-  $('resTitle').textContent = ['Keep practising!', 'Not bad!', 'Great singing!', 'Superstar!'][stars];
+  $('resTitle').textContent = r.practice
+    ? (mastered ? 'Line mastered!' : `Line ${r.practice.phrase + 1} practice`)
+    : ['Keep practising!', 'Not bad!', 'Great singing!', 'Superstar!'][stars];
   $('resStars').innerHTML = [0, 1, 2].map(k => `<span class="${k < stars ? '' : 'off'}">★</span>`).join('');
-  $('resScore').textContent = `${game.firstTry} / ${total} (${Math.round(ratio * 100)}%)`;
+  $('resScore').textContent = `${r.firstTry} / ${total} (${Math.round(ratio * 100)}%)`;
   $('resScoreLabel').textContent = settings.wallBreaks ? 'Holes cleared' : 'Cleared first try';
   $('resBouncesRow').hidden = settings.wallBreaks;
-  $('resBounces').textContent = String(game.bounces);
-  $('resStreak').textContent = String(game.bestStreak);
-  $('resCents').textContent = game.centsN ? `${Math.round(game.centsSum / game.centsN)} cents` : '—';
+  $('resBounces').textContent = String(r.bounces);
+  $('resStreak').textContent = String(r.bestStreak);
+  const passed = r.notes.filter(n => n.passed && n.voiced);
+  $('resCents').textContent = passed.length ? `${Math.round(passed.reduce((s, n) => s + n.cents, 0) / passed.length)}¢` : '—';
+  const lean = overallLean(r);
+  $('resLean').textContent = lean === null ? '—'
+    : Math.abs(lean) < 5 ? `${fmtCents(lean)} (centred)` : `${fmtCents(lean)} (${lean < 0 ? 'flat' : 'sharp'})`;
+  $('resRewindsRow').hidden = !r.rewinds;
+  $('resRewinds').textContent = String(r.rewinds);
+  const pct = t => `${Math.round(t * 100)}%`;
+  $('resTempoRow').hidden = r.tempoMin === 1 && r.tempoMax === 1;
+  $('resTempo').textContent = r.tempoMin === r.tempoMax ? pct(r.tempo) : `${pct(r.tempoMin)}–${pct(r.tempoMax)}`;
+  $('resSub').textContent = r.practice ? `“${r.practice.text}” · ${r.practice.pass} pass${r.practice.pass > 1 ? 'es' : ''}` : '';
+  $('resSub').hidden = !r.practice;
   ui.results.hidden = false;
+  // Practice results offer the same line again; full results offer each line.
+  renderReview($('resReview'), r, {
+    onPractice: r.practice ? null : k => {
+      const ph = r.phrases[k];
+      startPractice({ phrase: k, noteStart: ph.noteStart, noteEnd: ph.noteEnd, text: ph.text }, practiceTempo(r.tempo));
+    },
+  });
+  $('btnAgain').textContent = r.practice ? 'Practise again' : 'Play again';
+  $('btnBackFull').hidden = !r.practice || !lastFull;
+  $('btnFullSong').hidden = !r.practice;
+  ui.results.scrollTop = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Line practice: loop one line, starting a bit slow. A clean pass (every note
+// first try) speeds it up; two missed passes in a row slow it down; a clean
+// pass at full speed masters it.
+// ---------------------------------------------------------------------------
+// line: { phrase, noteStart, noteEnd, text } in the full sequence.
+function startPractice(line, tempo) {
+  startGame(true, { practice: { ...line, pass: 1, misses: 0 }, tempo });
+}
+// Start a bit slower than the speed the song was sung at.
+const practiceTempo = sungAt => Math.max(TEMPO_MIN, Math.min(PRACTICE_TEMPO, sungAt));
+
+function practiceLoop(r) {
+  const clean = r.firstTry === r.notes.length;
+  let msg;
+  if (clean && game.tempo >= 1 - 1e-6) { showResults(r, { mastered: true }); return; }
+  if (clean) {
+    practice.misses = 0;
+    msg = `Clean! Up to ${Math.round(Math.min(1, game.tempo + TEMPO_STEP) * 100)}%`;
+    game.tempo = Math.min(1, game.tempo + TEMPO_STEP);
+  } else {
+    practice.misses++;
+    msg = `${r.firstTry}/${r.notes.length} clean · again`;
+    if (practice.misses >= 2 && game.tempo > TEMPO_MIN + 1e-6) {
+      practice.misses = 0;
+      game.tempo = Math.max(TEMPO_MIN, game.tempo - TEMPO_STEP);
+      msg = `Slowing to ${Math.round(game.tempo * 100)}% · again`;
+    }
+  }
+  practice.lastReview = r;
+  practice.pass++;
+  setupRun(game.tempo);
+  toast(msg, clean ? '#5ee08a' : '#ffcc33');
+  startCountdown(2);
+}
+
+// Leave practice: back to the song's results if there are any.
+function endPractice() {
+  const r = practice.lastReview;
+  practice = null;
+  audio.stopNotes();
+  if (lastFull) showResults(lastFull);
+  else if (r) showResults(r);
+  else toMenu();
+}
+
+// ---------------------------------------------------------------------------
+// Live controls: rewind to the start of a line, slow down, speed up.
+// ---------------------------------------------------------------------------
+function setTempo(t, announce = true) {
+  game.tempo = Math.round(Math.max(TEMPO_MIN, Math.min(TEMPO_MAX, t)) * 100) / 100;
+  game.speed = baseSpeed() * game.tempo;
+  if (game.vel > game.speed) game.vel = game.speed;
+  game.tempoMin = Math.min(game.tempoMin, game.tempo);
+  game.tempoMax = Math.max(game.tempoMax, game.tempo);
+  ui.tempo.textContent = `${Math.round(game.tempo * 100)}%`;
+  ui.tempo.title = `${Math.round(settings.bpm * game.tempo)} BPM`;
+  ui.btnSlower.disabled = game.tempo <= TEMPO_MIN + 1e-6;
+  ui.btnFaster.disabled = game.tempo >= TEMPO_MAX - 1e-6;
+  if (announce) toast(`Speed ${Math.round(game.tempo * 100)}%`, '#9fb0ff');
+}
+
+function changeTempo(dir) {
+  if (!['playing', 'countdown', 'demo', 'paused'].includes(game.state)) return;
+  setTempo(game.tempo + dir * TEMPO_STEP);
+}
+
+// Back to the start of the current line; if no note of it has been cleared
+// yet, back to the line before. The walls from there on are rebuilt.
+function rewind() {
+  if (game.state !== 'playing' || !level.phrases.length) return;
+  const walls = level.walls;
+  const at = Math.min(game.nextWall, walls.length - 1);
+  let p = level.phrases.findIndex(ph => at <= ph.last);
+  if (game.nextWall <= level.phrases[p].first && p > 0) p--;
+  const ph = level.phrases[p];
+  for (let i = ph.first; i < walls.length; i++) resetWall(walls[i]);
+  game.d = Math.max(0, walls[ph.first].dStart - REWIND_RUNUP * BEAT_LEN);
+  game.nextWall = ph.first;
+  game.vel = game.speed;
+  game.streak = 0;
+  game.foldShift = null;
+  game.rewinds++;
+  ball.position.z = -game.d;
+  for (let k = 0; k < TRAIL_N; k++) trailPos.set([0, ball.position.y, ball.position.z], k * 3);
+  trailGeo.attributes.position.needsUpdate = true;
+  lyricCache = '';
+  toast(level.phrases.length > 1 ? `⏮ Line ${p + 1}` : '⏮ From the top', '#9fb0ff');
+}
+
+// Put a wall back as it was before the ball reached it. Misses already made
+// on it still count against "first try".
+function resetWall(w) {
+  if (w.state === 'pass') game.score--;
+  w.prior += w.attempts + (w.state === 'fail' ? 1 : 0);
+  Object.assign(w, freshAttempt(), { state: 'pending', toneDone: false, flash: 0 });
+  const k = fadingWalls.findIndex(f => f.w === w);
+  if (k >= 0) fadingWalls.splice(k, 1);
+  w.group.visible = w.mesh.visible = w.rim.visible = w.label.visible = true;
+  w.mesh.material.opacity = 0.72;
+  w.mesh.material.emissive.copy(w.color).multiplyScalar(0.12);
+  w.rim.material.color.set(0xffffff);
+  w.rim.material.emissive.set(0xffffff);
+  w.rim.material.emissiveIntensity = 0.5;
+  w.rim.material.opacity = 1;
+  w.label.material.opacity = 1;
+  if (w.lyricLabel) { w.lyricLabel.visible = true; w.lyricLabel.material.opacity = 1; }
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,7 +1362,7 @@ function updateWalls(prevD) {
     const demo = game.state === 'demo';
     if (settings.guideTone && !w.toneDone && game.d >= w.dStart - 0.9 * BEAT_LEN && game.state === 'playing') {
       w.toneDone = true;
-      const dur = Math.min(0.45, 0.6 * 60 / settings.bpm);
+      const dur = Math.min(0.45, 0.6 * 60 / (settings.bpm * game.tempo));
       audio.playTone(w.midi, dur, 0.16, !settings.headphones);
     }
 
@@ -1145,8 +1384,12 @@ function updateWalls(prevD) {
       const err = Math.abs(y - w.holeY);
       if (err > tol) w.outDist += overlap;
       if (game.sungMidi !== null) {
-        w.errSum += Math.abs(game.sungMidi - w.midi) * 100;
-        w.samples++;
+        // Weighted by distance covered, so the frame rate doesn't matter.
+        const c = (game.sungMidi - w.midi) * 100;
+        w.errSum += Math.abs(c) * overlap;
+        w.signedSum += c * overlap;
+        w.samples += overlap;
+        if (Math.abs(c) <= NEAR_CENTS) { w.nearSum += c * overlap; w.nearN += overlap; }
       }
       const allowance = Math.min(0.25 * game.speed, 0.5 * (w.dEnd - w.dStart));
       if (w.outDist > allowance) {
@@ -1171,8 +1414,6 @@ function resolveWall(w, passed) {
     game.streak++;
     game.bestStreak = Math.max(game.bestStreak, game.streak);
     const cents = w.samples ? w.errSum / w.samples : 0;
-    game.centsSum += cents;
-    game.centsN++;
     burst(w);
     if (w.attempts > 0) toast('Got it!', '#9be86b');
     else if (cents < 15) toast('Perfect!', '#5ee08a');
@@ -1191,11 +1432,7 @@ function resolveWall(w, passed) {
 }
 
 function bounceOff(w) {
-  w.attempts++;
-  w.outDist = 0;
-  w.errSum = 0;
-  w.samples = 0;
-  w.flash = 1;
+  Object.assign(w, freshAttempt(), { attempts: w.attempts + 1, flash: 1 }); // only the last try is reviewed
   game.bounces++;
   game.streak = 0;
   game.shake = 0.2;
@@ -1211,6 +1448,19 @@ function bounceOff(w) {
   if (settings.guideTone) setTimeout(() => {
     if (game.state === 'playing') audio.playTone(w.midi, 0.4, 0.16, !settings.headphones);
   }, 350);
+}
+
+// The sung pitch on the way to and through the next wall, for the review.
+// Only forward motion counts, and a bounce starts the trace over.
+const TRACE_STEP = 0.12; // world units between samples
+function recordTrace() {
+  const w = level.walls[game.nextWall];
+  if (!w || w.state !== 'pending' || game.vel <= 0 || game.d > w.dEnd) return;
+  const from = w.i > 0 ? level.walls[w.i - 1].dEnd : w.dStart - 2 * BEAT_LEN;
+  if (game.d < from) return;
+  const last = w.trace[w.trace.length - 1];
+  if (last && game.d - last.d < TRACE_STEP) return;
+  w.trace.push({ d: game.d, m: game.sungMidi });
 }
 
 // Walls flash red when the ball bounces off them.
@@ -1373,6 +1623,7 @@ function frame(t) {
 
     if (game.state === 'countdown' || game.state === 'playing') {
       updateBall(dt, prevD);
+      if (game.state === 'playing') recordTrace();
       updateWalls(prevD);
       constrainBall();
       updateHud();
@@ -1460,10 +1711,22 @@ ui.csDelete.addEventListener('click', () => {
 });
 $('btnPause').addEventListener('click', () => setPaused(true));
 $('btnResume').addEventListener('click', () => setPaused(false));
-$('btnQuit').addEventListener('click', toMenu);
+ui.btnQuit.addEventListener('click', () => { if (practice) endPractice(); else toMenu(); });
 $('btnPauseQuit').addEventListener('click', toMenu);
-$('btnAgain').addEventListener('click', () => startGame(settings.mode !== 'random'));
+$('btnAgain').addEventListener('click', () => {
+  const r = shownReview;
+  if (r.practice) startPractice(r.practice, practiceTempo(r.tempo));
+  else startGame(settings.mode !== 'random', { tempo: r.tempo });
+});
+$('btnBackFull').addEventListener('click', () => { practice = null; showResults(lastFull); });
+$('btnFullSong').addEventListener('click', () => { practice = null; startGame(true, { tempo: 1 }); });
 $('btnSettings').addEventListener('click', toMenu);
+// Playback controls. Buttons give up focus so Space/Enter don't re-press them.
+const hudButton = (btn, fn) => btn.addEventListener('click', e => { e.currentTarget.blur(); fn(); });
+hudButton(ui.btnRewind, rewind);
+hudButton(ui.btnSlower, () => changeTempo(-1));
+hudButton(ui.btnFaster, () => changeTempo(1));
+window.addEventListener('resize', () => { if (!ui.results.hidden) drawTraces($('resReview'), shownReview); });
 function skipIntro() {
   if (game.state === 'preview') endPreview();
   else if (game.state === 'demo') endDemo();
@@ -1481,6 +1744,10 @@ window.addEventListener('keydown', e => {
     saveSettings();
     writeForm();
   }
+  if (e.target.closest?.('input, select, textarea')) return;
+  if (e.key === 'ArrowLeft' || e.key === 'r' || e.key === 'R') { e.preventDefault(); rewind(); }
+  if (e.key === '-' || e.key === '_' || e.key === '[') { e.preventDefault(); changeTempo(-1); }
+  if (e.key === '=' || e.key === '+' || e.key === ']') { e.preventDefault(); changeTempo(1); }
   if (e.key === 'Escape' || e.key === 'p' || e.key === 'P') {
     if (game.state === 'paused') setPaused(false);
     else setPaused(true);

@@ -1,0 +1,17 @@
+{
+  "name": "Pitch Ball",
+  // "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "build": {
+		"dockerfile": "Dockerfile"
+	},
+  // "features": {
+  //   "ghcr.io/devcontainers/features/node:1": {
+  //     "version": "22"
+  //   }
+  // },
+  // "postCreateCommand": "npm install -g @anthropic-ai/claude-code",
+  "remoteUser": "vscode",
+  "appPort": ["8081:8081"],
+
+  "runArgs": ["--userns=keep-id", "--tmpfs", "/tmp:exec,mode=1777"]
+}

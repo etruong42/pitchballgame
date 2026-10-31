@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pitch Ball</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+    { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js" } }
+  </script>
+</head>
+<body>
+  <div id="stage"></div>
+
+  <!-- In-game HUD -->
+  <div id="hud" hidden>
+    <div class="hud-row">
+      <div class="hud-box"><span class="hud-label">Score</span><span id="hudScore">0 / 0</span></div>
+      <div class="hud-box"><span class="hud-label">Streak</span><span id="hudStreak">0</span></div>
+      <div class="hud-box wide"><span class="hud-label">Target</span><span id="hudTarget">—</span></div>
+      <div class="hud-box wide"><span class="hud-label">You</span><span id="hudSung">—</span></div>
+      <div class="hud-spacer"></div>
+      <button id="btnSkipPreview" class="ghost" hidden title="Skip (Space)">Skip scale ▸</button>
+      <button id="btnPause" class="ghost" title="Pause (Esc)">Pause</button>
+      <button id="btnQuit" class="ghost">Quit</button>
+    </div>
+    <div class="progress"><div id="hudProgress"></div></div>
+    <div id="mouseHint" hidden>Hold the mouse button (or touch) and move up/down to "sing"</div>
+    <!-- Lyrics: current line with the syllable to sing highlighted, then the next line -->
+    <div id="lyrics" class="lyrics" hidden aria-live="off">
+      <div id="lyricCur" class="ly-cur"></div>
+      <div id="lyricNext" class="ly-next"></div>
+    </div>
+    <!-- Pitch-detection debug overlay -->
+    <div id="debugOverlay" class="debug-overlay" hidden>
+      <div class="debug-title">Pitch detection <span class="hint">(D to hide)</span></div>
+      <canvas></canvas>
+      <div class="debug-legend">
+        <span style="--c:#5ee08a">clean</span><span style="--c:#ffcc33">usable</span><span style="--c:#4fd1ff">jump</span><span style="--c:#b48cff">unconfirmed</span><span style="--c:#ff6070">unclear (held)</span><span style="--c:#6b7394">quiet</span>
+        <span class="line" style="--c:#fff">filtered</span><span class="line dashed" style="--c:#78aaff">target</span>
+      </div>
+      <div class="debug-text"></div>
+    </div>
+    <!-- Tuner gauge: the note currently heard -->
+    <div id="tuner" class="tuner silent" hidden aria-live="off">
+      <svg viewBox="0 0 200 118" aria-hidden="true">
+        <g class="tuner-scale"></g>
+        <g id="tunerNeedle" class="needle">
+          <path d="M 100 30 L 103 100 L 97 100 Z"/>
+        </g>
+        <circle class="hub" cx="100" cy="100" r="6"/>
+      </svg>
+      <div class="tuner-readout">
+        <span id="tunerNote" class="tuner-note">—</span>
+        <span id="tunerCents" class="tuner-cents">listening…</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="countdown" hidden></div>
+  <div id="toast"></div>
+
+  <!-- Settings menu -->
+  <div id="menu" class="overlay">
+    <form id="settings" class="panel" autocomplete="off">
+      <header>
+        <h1>Pitch Ball</h1>
+        <p class="sub">Sing the note. Fly the ball through the hole.</p>
+      </header>
+
+      <section>
+        <h2>Notes to sing</h2>
+        <div class="seg">
+          <label><input type="radio" name="mode" value="song"><span>Song</span></label>
+          <label><input type="radio" name="mode" value="scale"><span>Scale</span></label>
+          <label><input type="radio" name="mode" value="random"><span>Random</span></label>
+        </div>
+
+        <div class="mode-panel" data-mode="song">
+          <div class="grid">
+            <label class="span2">Song
+              <select name="song" id="songSelect"></select></label>
+            <label>Key
+              <select name="songRoot" class="root-select" data-num></select></label>
+            <label>Octave
+              <select name="songOctave" class="octave-select" data-num></select></label>
+            <label class="span2">Mode
+              <select name="songMode" id="songModeSelect"></select></label>
+          </div>
+          <div id="customEditor" class="custom-editor" hidden>
+            <div class="grid">
+              <label class="span2">Song name
+                <input type="text" id="csName" maxlength="60" data-custom></label>
+              <label>Written in
+                <select id="csRoot" class="root-select" data-custom></select></label>
+              <label>Written mode
+                <select id="csMode" data-custom></select></label>
+            </div>
+            <label class="notes-label">Notes
+              <textarea id="csText" rows="7" spellcheck="false" autocapitalize="off" data-custom
+                placeholder="D4 G4:2 B4:0.5 G4:0.5 B4:2 A4 …"></textarea></label>
+            <label class="notes-label">Lyrics <span class="hint">(optional)</span>
+              <textarea id="csLyrics" rows="3" spellcheck="false" data-custom
+                placeholder="A-ma-zing _ grace how sweet the sound …"></textarea></label>
+            <p id="csStatus" class="cs-status" aria-live="polite"></p>
+            <details class="cs-help">
+              <summary>How to write notes</summary>
+              <ul>
+                <li><code>G4</code> one beat of G in octave 4 (<code>C4</code> is middle C). Sharps and flats: <code>F#3</code>, <code>Bb4</code>.</li>
+                <li><code>G4:2</code> two beats · <code>G4:0.5</code> half a beat · <code>G4:1/3</code> a triplet.</li>
+                <li><code>R:1</code> a one-beat rest: a gap with no wall.</li>
+                <li><code>G4:0.25~</code> a quick note: heard in the demo, but with no wall to fly through.</li>
+                <li>Separate notes with spaces, commas or new lines. <code>|</code> bar lines and <code>// comments</code> are ignored.</li>
+                <li><b>Written in</b> is the key you typed the notes in. Picking a song sets Key, Octave and Mode to match, so it plays as written; change them to transpose.</li>
+                <li><b>Lyrics</b>: one syllable per note, in order. Split words into syllables with hyphens (<code>A-ma-zing</code>), use <code>_</code> to hold a syllable over another note, and <code>/</code> or a new line to start a new line of the karaoke display.</li>
+                <li>Very short notes are slowed down to about 0.18 s each so the ball has time to move. Use <code>~</code> to keep fast runs exact.</li>
+              </ul>
+            </details>
+            <div class="cs-actions">
+              <button type="button" id="csExample" class="ghost small">Load example (Amazing Grace)</button>
+              <button type="button" id="csDelete" class="ghost small danger">Delete song</button>
+            </div>
+            <p class="hint">Saved automatically in this browser.</p>
+          </div>
+        </div>
+
+        <div class="mode-panel" data-mode="scale">
+          <div class="grid">
+            <label>Root
+              <select name="scaleRoot" class="root-select" data-num></select></label>
+            <label>Octave
+              <select name="scaleOctave" class="octave-select" data-num></select></label>
+            <label class="span2">Scale
+              <select name="scaleType" class="scale-select"></select></label>
+            <label>Direction
+              <select name="scaleDirection">
+                <option value="up">Up</option>
+                <option value="down">Down</option>
+                <option value="updown">Up &amp; down</option>
+              </select></label>
+            <label>Octaves
+              <select name="scaleOctaves" data-num>
+                <option value="1">1</option>
+                <option value="2">2</option>
+              </select></label>
+          </div>
+        </div>
+
+        <div class="mode-panel" data-mode="random">
+          <div class="grid">
+            <label>Lowest note
+              <select name="randomLow" class="note-select" data-num></select></label>
+            <label>Highest note
+              <select name="randomHigh" class="note-select" data-num></select></label>
+            <label>Key
+              <select name="randomRoot" class="root-select" data-num></select></label>
+            <label>Scale
+              <select name="randomScale" class="scale-select"></select></label>
+            <label>Number of notes
+              <input type="number" name="randomCount" min="4" max="100" step="1" data-num></label>
+            <label>Max jump (semitones)
+              <input type="number" name="randomMaxJump" min="1" max="12" step="1" data-num></label>
+          </div>
+          <button type="button" id="btnReshuffle" class="ghost small">Reshuffle</button>
+        </div>
+
+        <p id="preview" class="preview"></p>
+      </section>
+
+      <section>
+        <h2>Difficulty</h2>
+        <label class="range">Hole size
+          <input type="range" name="holeScale" min="1.2" max="5" step="0.1" data-num>
+          <span id="holeInfo" class="hint"></span>
+        </label>
+        <label class="range">Tempo
+          <input type="range" name="bpm" min="40" max="160" step="5" data-num>
+          <span id="bpmInfo" class="hint"></span>
+        </label>
+        <label class="check"><input type="checkbox" name="octaveFold">
+          <span>Any octave counts <span class="hint">(sing the note in whatever octave suits your voice — otherwise pick octave 3 for lower voices, 4 for higher ones)</span></span></label>
+        <label class="check"><input type="checkbox" name="wallBreaks">
+          <span>Walls break when you miss <span class="hint">(no second chances — otherwise the ball bounces back for another try)</span></span></label>
+        <label class="inline-select" id="retriesRow">Retries before the wall breaks anyway
+          <select name="maxRetries" data-num>
+            <option value="1">1 retry</option>
+            <option value="2">2 retries</option>
+            <option value="3">3 retries</option>
+            <option value="5">5 retries</option>
+            <option value="0">Unlimited</option>
+          </select></label>
+      </section>
+
+      <section>
+        <h2>Sound &amp; input</h2>
+        <div class="seg">
+          <label><input type="radio" name="input" value="mic"><span>Microphone</span></label>
+          <label><input type="radio" name="input" value="mouse"><span>Mouse / touch</span></label>
+        </div>
+        <label class="range" id="sensRow">Mic sensitivity
+          <input type="range" name="sensitivity" min="0" max="1" step="0.05" data-num>
+        </label>
+        <label class="check"><input type="checkbox" name="showTuner">
+          <span>Show tuner gauge <span class="hint">(the note the app hears; the needle leans left when flat, right when sharp)</span></span></label>
+        <label class="check"><input type="checkbox" name="showLyrics">
+          <span>Show lyrics <span class="hint">(the word to sing on each wall and in a karaoke line; scales and random notes show do-re-mi)</span></span></label>
+        <label class="check"><input type="checkbox" name="showDebug">
+          <span>Show pitch-detection debug overlay <span class="hint">(or press D during a game)</span></span></label>
+      </section>
+
+      <section>
+        <h2>Speaker sounds</h2>
+        <p class="hint">All off unless you turn them on. Your mic can pick up sound from your speakers, so the mic pauses while these play, unless you're wearing headphones.</p>
+        <label class="check"><input type="checkbox" name="previewScale">
+          <span>Play the scale first <span class="hint">(before the ball rolls, hear the challenge's scale and see the ball's height for each note)</span></span></label>
+        <label class="check"><input type="checkbox" name="demoTrack">
+          <span>Demo the track first <span class="hint">(plays the whole tune and shows the ball flying through every hole, then it's your turn)</span></span></label>
+        <label class="check"><input type="checkbox" name="guideTone">
+          <span>Play each note before you sing it</span></label>
+        <label class="check"><input type="checkbox" name="sfx">
+          <span>Sound effects</span></label>
+        <label class="check" id="headphonesRow"><input type="checkbox" name="headphones">
+          <span>I'm wearing headphones <span class="hint">(keeps the mic on while sounds play)</span></span></label>
+      </section>
+
+      <p id="menuError" class="error" hidden></p>
+      <button type="submit" id="btnStart" class="primary">Start singing</button>
+    </form>
+  </div>
+
+  <div id="pauseScreen" class="overlay" hidden>
+    <div class="panel small-panel">
+      <h2>Paused</h2>
+      <button id="btnResume" class="primary">Resume</button>
+      <button id="btnPauseQuit" class="ghost">Back to settings</button>
+    </div>
+  </div>
+
+  <div id="results" class="overlay" hidden>
+    <div class="panel small-panel">
+      <h2 id="resTitle">Nice singing!</h2>
+      <div id="resStars" class="stars"></div>
+      <dl class="stats">
+        <div><dt id="resScoreLabel">Holes cleared</dt><dd id="resScore"></dd></div>
+        <div id="resBouncesRow"><dt>Bounces</dt><dd id="resBounces"></dd></div>
+        <div><dt>Best streak</dt><dd id="resStreak"></dd></div>
+        <div><dt>Average pitch error</dt><dd id="resCents"></dd></div>
+      </dl>
+      <button id="btnAgain" class="primary">Play again</button>
+      <button id="btnSettings" class="ghost">Change settings</button>
+    </div>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

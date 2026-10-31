@@ -1,0 +1,9 @@
+{
+  "name": "pitch-ball",
+  "version": "1.0.0",
+  "description": "A 3D singing game: sing the right pitch to fly the ball through the hole in the wall.",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  }
+}
